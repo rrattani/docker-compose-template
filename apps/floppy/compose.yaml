@@ -1,0 +1,74 @@
+services:
+  floppy:
+    image: ghcr.io/dannyvfilms/floppy:latest
+    container_name: floppy
+    restart: unless-stopped
+    expose:
+      - 8000
+    env_file:
+      - .env
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.floppy.rule=Host(`${FLOPPY_HOSTNAME?}`)"
+      - "traefik.http.routers.floppy.entrypoints=websecure"
+      - "traefik.http.routers.floppy.tls.certresolver=letsencrypt"
+      - "traefik.http.services.floppy.loadbalancer.server.port=8000"
+    volumes:
+      - ${DOCKER_DATA_DIR}/floppy/db:/floppy/db
+      - ${DOCKER_DATA_DIR}/floppy/backups:/floppy/backups
+    depends_on:
+      floppy_redis:
+        condition: service_healthy
+#      floppy_postgres:
+#        condition: service_healthy
+    profiles:
+      - floppy
+      - all
+
+#  floppy_postgres:
+#    image: postgres:17-alpine
+#    restart: unless-stopped
+#    container_name: floppy_postgres
+#    user: "${PUID}:${PGID}"
+#    volumes:
+#      -  ${DOCKER_DATA_DIR}/floppy/db:/var/lib/postgresql/data
+#    environment:
+#      PUID: ${PUID}
+#      PGID: ${PGID}
+#      TZ: ${TZ}
+#      POSTGRES_USER: floppy
+#      POSTGRES_PASSWORD: floppy
+#      POSTGRES_DB: floppy
+#    healthcheck:
+#      test: ["CMD-SHELL", "pg_isready -U floppy -d floppy"]
+#      start_period: 1m
+#      interval: 20s
+#      timeout: 5s
+#      retries: 5
+#    profiles:
+#      - floppy
+#      - all  
+
+  floppy_redis:
+    image: redis:8-alpine
+    container_name: floppy_redis
+    restart: unless-stopped
+    user: "${PUID}:${PGID}"
+    environment:
+      PUID: ${PUID}
+      PGID: ${PGID}
+      TZ: ${TZ}
+    command: ["redis-server", "--appendonly", "yes", "--save", "", "--maxmemory", "256mb", "--maxmemory-policy", "volatile-lru"]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    volumes:
+      - ${DOCKER_DATA_DIR}/floppy/cache:/data
+    profiles:
+      - floppy
+      - all
+
+
