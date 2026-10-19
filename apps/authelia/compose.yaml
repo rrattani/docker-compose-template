@@ -65,6 +65,7 @@ services:
       - "traefik.http.middlewares.authelia.forwardAuth.address=http://authelia:9091/api/authz/forward-auth"
       - "traefik.http.middlewares.authelia.forwardAuth.trustForwardHeader=true"
       - "traefik.http.middlewares.authelia.forwardAuth.authResponseHeaders=Remote-User,Remote-Groups,Remote-Email,Remote-Name"
+      - "traefik.http.middlewares.authelia.forwardauth.maxResponseBodySize=1048576"
     volumes:
       - './config:/config'
     depends_on:

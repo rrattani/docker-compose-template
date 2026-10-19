@@ -1,0 +1,429 @@
+services:
+  # =========================================================================
+  # 1. Supabase PostgreSQL Core Database
+  # =========================================================================
+  nuvio_db:
+    image: supabase/postgres:17.6.1.141
+    container_name: nuvio_db
+    restart: unless-stopped
+    networks:
+      nuvio_internal:
+        aliases:
+          - db
+    volumes:
+      - ${DOCKER_DATA_DIR}/nuvio/db:/var/lib/postgresql/data
+      # Upstream init scripts (mounted as individual files so container's 00-initial-schema.sql is NOT overwritten)
+      - ${DOCKER_DATA_DIR}/nuvio/volumes/db/webhooks.sql:/docker-entrypoint-initdb.d/init-scripts/98-webhooks.sql:ro
+      - ${DOCKER_DATA_DIR}/nuvio/volumes/db/roles.sql:/docker-entrypoint-initdb.d/init-scripts/99-roles.sql:ro
+      - ${DOCKER_DATA_DIR}/nuvio/volumes/db/jwt.sql:/docker-entrypoint-initdb.d/init-scripts/99-jwt.sql:ro
+      # Upstream Supabase subservice migrations
+      - ${DOCKER_DATA_DIR}/nuvio/volumes/db/_supabase.sql:/docker-entrypoint-initdb.d/migrations/97-_supabase.sql:ro
+      - ${DOCKER_DATA_DIR}/nuvio/volumes/db/logs.sql:/docker-entrypoint-initdb.d/migrations/99-logs.sql:ro
+      - ${DOCKER_DATA_DIR}/nuvio/volumes/db/pooler.sql:/docker-entrypoint-initdb.d/migrations/99-pooler.sql:ro
+      - ${DOCKER_DATA_DIR}/nuvio/volumes/db/realtime.sql:/docker-entrypoint-initdb.d/migrations/99-realtime.sql:ro
+      # Nuvio application migrations (execute in numerical order)
+      - ${DOCKER_DATA_DIR}/nuvio/database/migrations/00000000000000_baseline.sql:/docker-entrypoint-initdb.d/migrations/99999999990000-nuvio-baseline.sql:ro
+      - ${DOCKER_DATA_DIR}/nuvio/database/migrations/00000000000001_auth_trigger.sql:/docker-entrypoint-initdb.d/migrations/99999999990001-nuvio-auth-trigger.sql:ro
+    env_file:
+      .env
+    environment:
+      POSTGRES_HOST: /var/run/postgresql
+    entrypoint:
+      [
+        "sh",
+        "-c",
+        "mkdir -p /etc/postgresql-custom && printf '%s' \"$$PGSODIUM_KEY\" > /etc/postgresql-custom/pgsodium_root.key && chmod 600 /etc/postgresql-custom/pgsodium_root.key && chown postgres:postgres /etc/postgresql-custom/pgsodium_root.key && exec docker-entrypoint.sh postgres -c config_file=/etc/postgresql/postgresql.conf -c log_min_messages=fatal"
+      ]
+    healthcheck:
+      test:
+        [
+        "CMD-SHELL",
+        "pg_isready -U postgres -h localhost && psql -U supabase_admin -d \"$${POSTGRES_DB}\" -Atqc \"select exists(select 1 from nuvio_migrations.schema_migrations where version = '00000000000000')\" | grep -qx t"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    profiles:
+      - nuvio
+      - all
+
+  # =========================================================================
+  # 2. Supabase Auth (GoTrue)
+  # =========================================================================
+  nuvio_auth:
+    image: supabase/gotrue:v2.189.0
+    container_name: nuvio_auth
+    restart: unless-stopped
+    networks:
+      nuvio_internal:
+        aliases:
+          - auth
+    env_file:
+      - .env
+    depends_on:
+      nuvio_db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9999/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    profiles:
+      - nuvio
+      - all
+
+  # =========================================================================
+  # 3. Supabase PostgREST (Data & Catalog API)
+  # =========================================================================
+  nuvio_rest:
+    image: postgrest/postgrest:v14.12
+    container_name: nuvio_rest
+    restart: unless-stopped
+    networks:
+      nuvio_internal:
+        aliases:
+          - rest
+    env_file:
+      - .env
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    depends_on:
+      nuvio_db:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "postgrest", "--ready" ]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+    command:
+      [
+        "postgrest"
+      ]
+    profiles:
+      - nuvio
+      - all
+
+  # =========================================================================
+  # 4. Supabase Realtime (WebSockets State Sync)
+  # =========================================================================
+  nuvio_realtime:
+    image: supabase/realtime:v2.102.3
+    container_name: nuvio_realtime
+    restart: unless-stopped
+    networks:
+      nuvio_internal:
+        aliases:
+          - realtime-dev
+    env_file:
+      - .env
+    depends_on:
+      nuvio_db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sSfL --head -o /dev/null -H \"Authorization: Bearer ${ANON_KEY}\" http://localhost:4000/api/tenants/realtime-dev/health"
+        ]
+      timeout: 5s
+      interval: 30s
+      retries: 3
+      start_period: 10s
+    profiles:
+      - nuvio
+      - all
+
+  # =========================================================================
+  # 5. Supabase Storage API & Imgproxy
+  # =========================================================================
+  nuvio_storage:
+    image: supabase/storage-api:v1.60.4
+    container_name: nuvio_storage
+    restart: unless-stopped
+    user: "${PUID}:${PGID}"
+    networks:
+      nuvio_internal:
+        aliases:
+          - storage
+    expose:
+      - 5000
+    env_file:
+      - .env
+    environment:
+      SERVER_PORT: 5000
+      PORT: 5000
+      POSTGREST_URL: http://rest:3000
+      REQUEST_ALLOW_X_FORWARDED_PATH: "true"
+    volumes:
+      - ${DOCKER_DATA_DIR}/nuvio/storage:/var/lib/storage
+    depends_on:
+      nuvio_db:
+        condition: service_healthy
+      nuvio_rest:
+        condition: service_started
+      nuvio_imgproxy:
+        condition: service_started
+    healthcheck:
+      test:
+        - "CMD"
+        - "wget"
+        - "--no-verbose"
+        - "--tries=1"
+        - "--spider"
+        - "http://storage:5000/status"
+      timeout: 5s
+      interval: 5s
+      retries: 3
+      start_period: 10s
+    profiles:
+      - nuvio
+      - all
+
+
+  nuvio_imgproxy:
+    image: darthsim/imgproxy:v3.30.1
+    container_name: nuvio_imgproxy
+    restart: unless-stopped
+    user: "${PUID}:${PGID}"
+    networks:
+      nuvio_internal:
+        aliases:
+          - imgproxy
+    env_file:
+      - .env
+    volumes:
+      - ${DOCKER_DATA_DIR}/nuvio/storage:/var/lib/storage
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "imgproxy",
+          "health"
+        ]
+      timeout: 5s
+      interval: 5s
+      retries: 3
+    profiles:
+      - nuvio
+      - all
+
+  # =========================================================================
+  # 6. Supabase Meta (Postgres Schema Introspection)
+  # =========================================================================
+  nuvio_meta:
+    image: supabase/postgres-meta:v0.96.6
+    container_name: nuvio_meta
+    restart: unless-stopped
+    networks:
+      nuvio_internal:
+        aliases:
+          - meta
+    env_file:
+      - .env
+    depends_on:
+      nuvio_db:
+        condition: service_healthy
+    profiles:
+      - nuvio
+      - all
+
+  # =========================================================================
+  # 7. Supabase Studio (Database Admin UI)
+  # =========================================================================
+  nuvio_studio:
+    image: supabase/studio:2026.06.03-sha-0bca601
+    container_name: nuvio_studio
+    restart: unless-stopped
+    networks:
+      nuvio_internal:
+        aliases:
+          - studio
+    env_file:
+      - .env
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"fetch('http://localhost:3000/api/platform/profile').then((r) => {if (r.status !== 200) throw new Error(r.status)})\""
+        ]
+      timeout: 10s
+      interval: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      nuvio_meta:
+        condition: service_started
+      nuvio_db:
+        condition: service_healthy
+    profiles:
+      - nuvio
+      - all
+
+  # =========================================================================
+  # 8. Supabase Edge Functions Runtime
+  # =========================================================================
+  nuvio_functions:
+    image: supabase/edge-runtime:v1.74.0
+    container_name: nuvio_functions
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/127.0.0.1/9000'"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+    command:
+      - start
+      - --main-service
+      - /home/deno/functions/main
+    networks:
+      default:
+      nuvio_internal:
+        aliases:
+          - functions
+    env_file:
+      - .env
+    environment:
+      # New opaque API keys
+      SUPABASE_PUBLISHABLE_KEYS: "{\"default\":\"${SUPABASE_PUBLISHABLE_KEY:-}\"}"
+      SUPABASE_SECRET_KEYS: "{\"default\":\"${SUPABASE_SECRET_KEY:-}\"}"
+      SUPABASE_DB_URL: postgresql://postgres:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
+      # TODO: Allow configuring VERIFY_JWT per function.
+      VERIFY_JWT: "${FUNCTIONS_VERIFY_JWT}"
+    volumes:
+      - ${DOCKER_DATA_DIR}/nuvio/volumes/functions:/home/deno/functions:ro
+      - deno-cache:/root/.cache/deno
+    profiles:
+      - nuvio
+      - all
+
+  # =========================================================================
+  # 9. Kong API Gateway (Handles All API, Storage, and System Endpoints)
+  # =========================================================================
+  nuvio_kong:
+    image: kong:3.9.1
+    container_name: nuvio_kong
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    networks:
+      default:
+      nuvio_internal:
+        aliases:
+          - kong
+          - api-gw
+    env_file:
+      - .env
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /usr/local/kong/kong.yml
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_DNS_NOT_FOUND_TTL: 1
+      KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth,request-termination,post-function
+      KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
+      KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
+      KONG_PROXY_ACCESS_LOG: /dev/stdout combined
+      # Bump when bind-mounted gateway configuration requires recreation.
+      NUVIO_GATEWAY_CONFIG_VERSION: "discovery-v1"
+    volumes:
+      - ${DOCKER_DATA_DIR}/nuvio/volumes/api/kong.yml:/home/kong/temp.yml:ro
+      - ${DOCKER_DATA_DIR}/nuvio/volumes/api/kong-entrypoint.sh:/home/kong/kong-entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/home/kong/kong-entrypoint.sh"]
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${DOCKER_NETWORK:-aio_default}"
+
+      # ---------------------------------------------------------------------
+      # 1. Header Middleware: Automatically Injects ANON_KEY
+      # ---------------------------------------------------------------------
+      - "traefik.http.middlewares.nuvio-tv-anon-headers.headers.customrequestheaders.apikey=${NUVIO_ANON_KEY}"
+      - "traefik.http.middlewares.nuvio-tv-anon-headers.headers.customrequestheaders.Authorization=Bearer ${NUVIO_ANON_KEY}"
+
+      # ---------------------------------------------------------------------
+      # 2. Highest Priority Router: Unauthenticated TV Login & Pairing RPCs
+      # ---------------------------------------------------------------------
+      - "traefik.http.routers.nuvio-tv-auth.rule=Host(`${NUVIO_HOSTNAME}`) && (Path(`/rest/v1/rpc/start_tv_login_session`) || Path(`/rest/v1/rpc/poll_tv_login_session`) || PathPrefix(`/functions/v1/tv-logins-exchange`))"
+      - "traefik.http.routers.nuvio-tv-auth.entrypoints=websecure"
+      - "traefik.http.routers.nuvio-tv-auth.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.nuvio-tv-auth.priority=30"
+      - "traefik.http.routers.nuvio-tv-auth.middlewares=nuvio-tv-anon-headers"
+      - "traefik.http.routers.nuvio-tv-auth.service=nuvio-api"
+
+      # ---------------------------------------------------------------------
+      # 3. Standard API Router: General Supabase & Discovery Endpoints
+      # ---------------------------------------------------------------------
+      - "traefik.http.routers.nuvio-api.rule=Host(`${NUVIO_HOSTNAME}`) && (PathPrefix(`/auth/v1`) || PathPrefix(`/rest/v1`) || PathPrefix(`/storage/v1`) || PathPrefix(`/realtime/v1`) || PathPrefix(`/functions/v1`) || PathPrefix(`/graphql/v1`) || PathPrefix(`/.well-known`) || PathPrefix(`/sso`) || Path(`/api/mcp`))"
+      - "traefik.http.routers.nuvio-api.entrypoints=websecure"
+      - "traefik.http.routers.nuvio-api.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.nuvio-api.priority=20"
+      - "traefik.http.services.nuvio-api.loadbalancer.server.port=8000"
+    depends_on:
+      nuvio_db:
+        condition: service_healthy
+      nuvio_auth:
+        condition: service_healthy
+      nuvio_rest:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "kong health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    profiles:
+      - nuvio
+      - all
+
+  # =========================================================================
+  # 10. Nuvio Account Dashboard (Customer-Facing Web UI)
+  # =========================================================================
+  nuvio_dashboard:
+    image: ghcr.io/nuviomedia/nuvio-account-dashboard:latest
+    container_name: nuvio_dashboard
+    restart: unless-stopped
+    expose:
+      - 4000
+    healthcheck:
+      disable: true
+    networks:
+      default:
+      nuvio_internal:
+        aliases:
+          - account-dashboard
+    env_file:
+      - .env
+    environment:
+      NUVIO_SUPABASE_URL: ${SUPABASE_PUBLIC_URL}
+      NUVIO_SUPABASE_ANON_KEY: ${ANON_KEY}
+      NUVIO_PUBLIC_SITE_URL: ${SITE_URL}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${DOCKER_NETWORK:-aio_default}"
+      - "traefik.http.routers.nuvio-ui.rule=Host(`${NUVIO_HOSTNAME}`)"
+      - "traefik.http.routers.nuvio-ui.entrypoints=websecure"
+      - "traefik.http.routers.nuvio-ui.tls=true"
+      - "traefik.http.routers.nuvio-ui.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.nuvio-ui.priority=10"
+      - "traefik.http.routers.nuvio-ui.service=nuvio-ui"
+      - "traefik.http.services.nuvio-ui.loadbalancer.server.port=4000"
+    depends_on:
+      nuvio_kong:
+        condition: service_healthy
+    profiles:
+      - nuvio
+      - all
+
+volumes:
+  deno-cache:
+
+# ===========================================================================
+# Internal Isolated Network
+# ===========================================================================
+networks:
+  nuvio_internal:
+    internal: true
