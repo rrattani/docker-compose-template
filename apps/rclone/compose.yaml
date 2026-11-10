@@ -6,6 +6,7 @@ services:
     user: $PUID:$PGID
     expose:
       - 5572
+      - 5573
     volumes:
       - ${DOCKER_DATA_DIR}/rclone/config:/config/rclone     # Persists your config file
       - ${DOCKER_DATA_DIR}/rclone/data:/data                # Local data directory you want to sync
@@ -15,17 +16,29 @@ services:
       - TZ=${TZ}
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.rclone.rule=Host(`${RCLONE_HOSTNAME?}`)"
-      - "traefik.http.routers.rclone.entrypoints=websecure"
-      - "traefik.http.routers.rclone.tls.certresolver=letsencrypt"
-      - "traefik.http.routers.rclone.middlewares=authelia@docker"
-      - "traefik.http.services.rclone.loadbalancer.server.port=5572"
+
+      # --- Web Frontend Router (Port 5572) ---
+      - "traefik.http.routers.rclone-gui.rule=Host(`${RCLONE_HOSTNAME?}`)"
+      - "traefik.http.routers.rclone-gui.entrypoints=websecure"
+      - "traefik.http.routers.rclone-gui.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.rclone-gui.middlewares=authelia@docker"
+      - "traefik.http.routers.rclone-gui.service=rclone-gui-svc"
+      - "traefik.http.services.rclone-gui-svc.loadbalancer.server.port=5572"
+
+      # --- Backend API Router (Port 5573) ---
+      - "traefik.http.routers.rclone-api.rule=Host(`${RCLONE_HOSTNAME?}`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.rclone-api.entrypoints=websecure"
+      - "traefik.http.routers.rclone-api.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.rclone-api.middlewares=authelia@docker"
+      - "traefik.http.routers.rclone-api.service=rclone-api-svc"
+      - "traefik.http.services.rclone-api-svc.loadbalancer.server.port=5573"
     command: >
-      rcd 
-      --rc-web-gui 
-      --rc-web-gui-no-open-browser 
-      --rc-addr :5572 
-      --rc-no-auth
+      gui 
+      --no-open-browser 
+      --addr :5572 
+      --api-addr :5573
+      --rc-baseurl /api
+      --no-auth
       --cache-dir /config/rclone/cache
     profiles:
       - rclone
